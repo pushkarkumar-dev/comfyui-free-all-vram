@@ -28,21 +28,23 @@ The cleanup does six things:
    worker the next time you use it, at the cost of a few seconds of model loading.
 4. **Stops orphaned workers** left on the GPU by a ComfyUI that crashed or was
    restarted. It also does this once at startup.
-5. **Reports models a custom node keeps on the GPU for itself,** with the package that
-   holds them. You can opt in, per package, to move those models to RAM on unload;
-   they move back automatically the next time they're used.
+5. **Reports models a custom node keeps on the GPU for itself,** in its module globals,
+   caches, or class or object attributes. The report names the package and where the
+   model is held, e.g. `CACHE['sdxl']`. You can opt in, per package, to move those models
+   to RAM on unload; they move back automatically the next time they're used.
 6. **Returns PyTorch's cached memory** to the driver.
 
 Each unload logs one line:
 
 ```
 [Free All VRAM] GPU memory in use 11.3 -> 3.4 GB. Stopped worker process(es): pid 19908 qwen3_asr_worker.py (tts_audio_suite), pid 6068 persistent_worker.py (comfy-env).
-[Free All VRAM] still on the GPU, kept by custom nodes: Sequential 2.00 GB held by some_node_pack (__init__.py). ...
+[Free All VRAM] still on the GPU, kept by custom nodes: Sequential 2.00 GB held by some_node_pack (_MODEL). ...
 ```
 
 ## Install
 
-- **ComfyUI Manager:** search for **Free All VRAM**.
+- **ComfyUI Manager:** choose **Install via Git URL** and paste
+  `https://github.com/pushkarkumar-dev/comfyui-free-all-vram`.
 - **Manually:**
   ```
   cd ComfyUI/custom_nodes
@@ -66,13 +68,13 @@ Restart ComfyUI. The console should show
   about to stop. There's a ready-made workflow in `example_workflows/`, which also
   appears in ComfyUI's template browser.
 - **What's holding VRAM right now:** `http://127.0.0.1:8188/free_all_vram/status`
-  returns this as JSON:
+  returns this as JSON. It's safe to poll at any time, including during a job.
   - `gpu_used_gb`: memory in use on the whole card, all processes
   - `comfy_loaded_models`
   - `worker_processes`
   - `orphaned_workers`
-  - `leftover_models`: `null` while a job is running, because models in use would look
-    like leftovers
+  - `last_unload`: the result of the most recent cleanup: when it ran, memory before
+    and after, stopped workers, models moved to RAM, and leftover models
   - the active settings
 
 ## Settings
@@ -84,7 +86,7 @@ re-read on every unload, so changes need no restart.
 |---|---|---|
 | `stop_workers_on_unload` | `true` | Stop GPU worker processes and orphaned workers on unload. |
 | `clear_node_cache_on_unload` | `true` | Also clear the node cache. It is always cleared when a worker was stopped, because cached outputs may refer to it. |
-| `scan_leftovers` | `true` | Look for models custom nodes keep on the GPU. This adds about a second to each unload. |
+| `scan_leftovers` | `true` | Look for models custom nodes keep on the GPU. Takes milliseconds. |
 | `offload_leftovers_from` | `[]` | Package folder names (as shown in the log) whose leftover models are moved to RAM on unload, or `["*"]` for all of them. |
 | `auto_free_after_idle_minutes` | `10` | Unload after this many idle minutes following a job. `0` turns it off. |
 | `auto_free_only_if_workers` | `true` | Only auto-unload when a worker process is holding the GPU. |
@@ -131,6 +133,18 @@ after you opt in, remove it from `offload_leftovers_from` and restart ComfyUI.
 Delete the `comfyui-free-all-vram` folder and restart ComfyUI. Unload Models goes back
 to ComfyUI's stock behaviour. To switch off individual parts without uninstalling,
 change the settings above.
+
+## Changelog
+
+- **1.0.1**
+  - **Crash fix.** 1.0.0 searched for leftover models by scanning every object in the
+    process, and the status page ran that scan even during a job. This could make the
+    running job fail with `SystemError: ... tupleobject.c ... bad argument to internal
+    function`, or abort ComfyUI. Leftovers are now found through each custom node
+    package's own globals, which is safe and takes milliseconds. The status page never
+    scans; it reports the last unload instead.
+  - The idle timer now also notices jobs shorter than its 30-second check interval.
+- **1.0.0:** first release.
 
 ## License
 

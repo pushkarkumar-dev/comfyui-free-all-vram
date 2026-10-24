@@ -236,6 +236,19 @@ def gpu_used_gb():
 
 
 # ---------------------------------------------------------------- leftover models in this process
+#
+# Found by walking what each custom-node package reaches from its own module globals (variables,
+# containers, its classes' attributes, objects' attributes), never with gc.get_objects() or
+# gc.get_referrers(): those take a reference to every object in the process, including a tuple
+# another thread is still building, which then fails with "SystemError: ... tupleobject.c ... bad
+# argument to internal function" - and a job running at the time can abort the whole process.
+
+LEFTOVER_MAX_DEPTH = 5
+LEFTOVER_MAX_OBJECTS = 5000  # per package
+_SKIP_TYPES = (str, bytes, bytearray, int, float, complex, bool, type(None), types.ModuleType, types.FunctionType,
+               types.BuiltinFunctionType, types.MethodType, weakref.ReferenceType, weakref.ProxyType,
+               weakref.CallableProxyType, torch.Tensor)
+
 
 def package_of(path):
     """(custom node package, file inside it) for a path, or None."""
@@ -257,74 +270,66 @@ def accelerator_bytes(module):
     return sum(t.numel() * t.element_size() for t in itertools.chain(module.parameters(), module.buffers()) if on_accelerator(t))
 
 
-def owner_of(obj, ignore, module_dicts, max_depth=8, max_visits=2000):
-    """(package, holder) of the custom node keeping obj alive, found by walking referrers.
-
-    Breadth-first, one gc.get_referrers() call per level: each call walks the whole heap."""
-    seen = {id(obj)}
-    frontier = [obj]
-    for _ in range(max_depth):
-        ignore.add(id(frontier))
-        nxt = []
-        ignore.add(id(nxt))
-        for r in gc.get_referrers(*frontier):
-            rid = id(r)
-            if rid in seen or rid in ignore or type(r) is types.FrameType:
-                continue
-            seen.add(rid)
-            if rid in module_dicts:
-                return module_dicts[rid]
-            # type() rather than isinstance(): dead weakref proxies raise on __class__
-            t = r if issubclass(type(r), type) else type(r)
-            owner = package_of(getattr(sys.modules.get(t.__module__), "__file__", None))
-            if owner:
-                return owner[0], t.__qualname__
-            nxt.append(r)
-        if not nxt or len(seen) > max_visits:
-            return None
-        frontier = nxt
-    return None
+def children_of(o, pkg_modules):
+    """(name, child) pairs of a container or plain object, read without running any of its code."""
+    t = type(o)
+    if issubclass(t, _SKIP_TYPES):
+        return []
+    if t in (list, tuple, set, frozenset):
+        return [(f"[{i}]", c) for i, c in enumerate(list(o))]
+    if issubclass(t, dict):
+        return [(f"[{k!r:.40}]", v) for k, v in list(dict.items(o))]
+    if issubclass(t, type) and o.__module__ not in pkg_modules:
+        return []  # only the package's own classes, not every library class it imports
+    try:
+        d = object.__getattribute__(o, "__dict__")
+    except Exception:
+        return []
+    if not isinstance(d, (dict, types.MappingProxyType)):
+        return []
+    return [(f".{k}", v) for k, v in list(d.items())]
 
 
 def leftover_models():
-    """Top-level torch modules in this process still holding VRAM that ComfyUI doesn't manage.
+    """Top-level torch modules on an accelerator that custom nodes keep and ComfyUI doesn't manage.
 
-    Returns [(module, bytes, (package, holder) or None)]."""
+    Returns [(module, bytes, (package, where))], where is e.g. "_MODEL" or "Loader.cache['sdxl']"."""
     managed = set()
     for lm in mm.current_loaded_models:
         m = getattr(lm.model, "model", None) if lm.model is not None else None
         if isinstance(m, torch.nn.Module):
             managed.update(id(x) for x in m.modules())
-    modules = [o for o in gc.get_objects() if issubclass(type(o), torch.nn.Module)]
-    nested = set()
-    for m in modules:
-        try:
-            nested.update(id(c) for c in m.children())
-        except Exception:
-            pass
-    found = []
-    for m in modules:
-        if id(m) in nested or id(m) in managed:
-            continue
-        try:
-            size = accelerator_bytes(m)
-        except Exception:
-            continue
-        if size >= LEFTOVER_MIN_BYTES:
-            found.append((m, size))
-    if not found:
-        return []
-    module_dicts = {}
-    for mod in list(sys.modules.values()):
+    packages = {}
+    for name, mod in list(sys.modules.items()):
         owner = package_of(getattr(mod, "__file__", None))
         if owner:
-            module_dicts[id(getattr(mod, "__dict__", None))] = owner
-    ignore = {id(modules), id(found)}
-    result = []
-    ignore.add(id(result))
-    for m, size in found:
-        result.append((m, size, owner_of(m, ignore, module_dicts)))
-    return result
+            packages.setdefault(owner[0], []).append((name, mod))
+    found = {}
+    for pkg, mods in packages.items():
+        pkg_modules = {name for name, _ in mods}
+        seen = set()
+        frontier = [(k, v) for _, mod in mods for k, v in list(vars(mod).items()) if not k.startswith("__")]
+        for _ in range(LEFTOVER_MAX_DEPTH):
+            nxt = []
+            for where, o in frontier:
+                if id(o) in seen or len(seen) > LEFTOVER_MAX_OBJECTS:
+                    continue
+                seen.add(id(o))
+                if issubclass(type(o), torch.nn.Module):
+                    if id(o) not in managed and id(o) not in found:
+                        try:
+                            size = accelerator_bytes(o)
+                        except Exception:
+                            continue
+                        if size >= LEFTOVER_MIN_BYTES:
+                            found[id(o)] = (o, size, (pkg, where))
+                    continue
+                try:
+                    nxt.extend((where + name, c) for name, c in children_of(o, pkg_modules))
+                except Exception:
+                    pass
+            frontier = nxt
+    return list(found.values())
 
 
 def offload(module):
@@ -340,7 +345,7 @@ def offload(module):
 
 
 def leftover_label(m, size, owner):
-    return f"{type(m).__name__} {size / GB:.2f} GB " + (f"held by {owner[0]} ({owner[1]})" if owner else "(holder unknown)")
+    return f"{type(m).__name__} {size / GB:.2f} GB held by {owner[0]} ({owner[1]})"
 
 
 # ---------------------------------------------------------------- the unload hook
@@ -348,6 +353,8 @@ def leftover_label(m, size, owner):
 # The prompt executor owns the node cache; captured so the cache can be cleared right away.
 # Setting the "free_memory" flag instead would only take effect after the next prompt.
 _executors = weakref.WeakSet()
+# Result of the most recent cleanup, for the status endpoint (which must never scan the heap itself).
+_last_unload = {}
 
 
 def prompt_running():
@@ -378,7 +385,7 @@ def free_everything(before):
             logging.warning(f"{TAG} leftover model scan failed: {e}")
         for m, size, owner in leftovers:
             label = leftover_label(m, size, owner)
-            if "*" in allow or (owner and owner[0] in allow):
+            if "*" in allow or owner[0] in allow:
                 try:
                     offload(m)
                     offloaded.append(label)
@@ -391,6 +398,9 @@ def free_everything(before):
     mm.soft_empty_cache()
 
     after = gpu_used_gb()
+    _last_unload.update(time=time.strftime("%Y-%m-%d %H:%M:%S"), gpu_used_gb_before=before, gpu_used_gb_after=after,
+                        stopped_workers=stopped, moved_to_ram=offloaded,
+                        leftover_models=kept if cfg["scan_leftovers"] else None)
     msg = f"{TAG} GPU memory in use {before:.1f} -> {after:.1f} GB." if before is not None and after is not None else f"{TAG} done."
     if stopped:
         msg += f" Stopped worker process(es): {', '.join(stopped)}."
@@ -415,10 +425,14 @@ def idle_watch():
         logging.warning(f"{TAG} orphan check failed: {e}")
     last_busy = time.monotonic()
     armed = False
+    last_prompt = getattr(server.PromptServer.instance, "last_prompt_id", None)
     while True:
         time.sleep(30)
         try:
-            if q.get_tasks_remaining() > 0:
+            # last_prompt_id also catches jobs that started and finished between two checks
+            prompt = getattr(server.PromptServer.instance, "last_prompt_id", None)
+            if q.get_tasks_remaining() > 0 or prompt != last_prompt:
+                last_prompt = prompt
                 last_busy = time.monotonic()
                 armed = True
                 continue
@@ -438,27 +452,25 @@ def idle_watch():
 # ---------------------------------------------------------------- status endpoint and node
 
 def status():
+    """Runs on a server thread, possibly during a prompt: processes and plain attributes only."""
     cfg = load_config()
-    running = prompt_running()
+    # Names only: model_loaded_memory() calls into comfy-aimdo for dynamic-VRAM models, which a
+    # running prompt is using at the same time.
     loaded = []
     for lm in list(mm.current_loaded_models):
         try:
-            loaded.append({"model": type(lm.model.model).__name__, "loaded_gb": round(lm.model_loaded_memory() / GB, 2)})
+            loaded.append(type(lm.model.model).__name__)
         except Exception:
             pass
-    report = {
+    return {
         "gpu_used_gb": gpu_used_gb(),
-        "prompt_running": running,
+        "prompt_running": prompt_running(),
         "comfy_loaded_models": loaded,
         "worker_processes": [describe(p) for p in gpu_workers(cfg)],
         "orphaned_workers": [describe(p) for p in orphan_workers(cfg)],
-        # While a prompt runs, models in use by custom nodes would show up as leftovers.
-        "leftover_models": None,
+        "last_unload": dict(_last_unload) or None,
         "config": cfg,
     }
-    if cfg["scan_leftovers"] and not running:
-        report["leftover_models"] = [leftover_label(m, s, o) for m, s, o in leftover_models()]
-    return report
 
 
 async def status_route(request):
@@ -540,6 +552,7 @@ def install():
 
     server.PromptServer.instance.routes.get("/free_all_vram/status")(status_route)
     write_default_config()
+    gpu_used_gb()  # resolve the NVML handle here, not later on a server thread
     threading.Thread(target=idle_watch, name="free-all-vram-idle", daemon=True).start()
     logging.info(f"{TAG} active: Unload Models also stops GPU worker processes, clears the node cache and reports leftover models")
     return True
