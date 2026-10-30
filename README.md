@@ -127,6 +127,11 @@ after you opt in, remove it from `offload_leftovers_from` and restart ComfyUI.
   model node."** comfy-env prints this traceback ("Exception ignored in
   ModelPatcher.__del__") the next time you use a node whose worker was stopped. It's
   harmless: the node starts a new worker and runs normally.
+- **"[Free All VRAM] ComfyUI's unload failed (...), unloading the models one by one"**
+  followed by **"dropped a model ComfyUI could not unload"**: a model in ComfyUI's list
+  could not be unloaded, typically a comfy-env model whose worker crashed or was killed
+  after a timeout. It is dropped from the list, everything else is unloaded as usual,
+  and the queue keeps running.
 
 ## Uninstall
 
@@ -136,6 +141,10 @@ change the settings above.
 
 ## Changelog
 
+- **1.0.2:** **Queue stall fix.** If ComfyUI's own unload raised, the error ended
+  ComfyUI's prompt thread and no job ran again until a restart. This happened when a
+  comfy-env worker (e.g. Depth Anything V3) had died or timed out and its model was
+  still listed as loaded. A model that can't be unloaded is now dropped instead.
 - **1.0.1**
   - **Crash fix.** 1.0.0 searched for leftover models by scanning every object in the
     process, and the status page ran that scan even during a job. This could make the

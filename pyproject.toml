@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-free-all-vram"
 description = "Makes Unload Models free everything: also stops custom-node worker processes that keep VRAM (isolated runtimes, comfy-env), cleans up orphaned workers and reports models custom nodes keep on the GPU."
-version = "1.0.1"
+version = "1.0.2"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["psutil", "nvidia-ml-py"]

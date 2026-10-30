@@ -363,6 +363,28 @@ def prompt_running():
         return len(q.currently_running) > 0
 
 
+def unload_one_by_one():
+    """ComfyUI's unload, but a model that can't be unloaded is dropped instead of raising.
+
+    ComfyUI unloads on its prompt thread, and an exception there ends that thread: the queue stops
+    for good. Seen with comfy-env models whose worker process is gone (killed after its 600 s
+    timeout): every unload of them raises "Subprocess worker died"."""
+    devices = mm.get_all_torch_devices()
+    keep = []
+    for lm in list(mm.current_loaded_models):
+        if lm.real_model is None:
+            continue  # unloaded by the failed attempt before it raised
+        if lm.device not in devices or lm.is_dead():
+            keep.append(lm)
+            continue
+        try:
+            lm.model_unload()
+        except Exception as e:
+            logging.warning(f"{TAG} dropped a model ComfyUI could not unload: {e}")
+    mm.current_loaded_models[:] = keep
+    mm.soft_empty_cache()
+
+
 def free_everything(before):
     cfg = load_config()
     procs = gpu_workers(cfg) + orphan_workers(cfg) if cfg["stop_workers_on_unload"] else []
@@ -540,7 +562,11 @@ def install():
             logging.exception(f"{TAG} cleanup skipped")
             idle = False
         before = gpu_used_gb() if idle else None
-        orig_unload_all_models(*args, **kwargs)
+        try:
+            orig_unload_all_models(*args, **kwargs)
+        except Exception as e:
+            logging.warning(f"{TAG} ComfyUI's unload failed ({e}), unloading the models one by one")
+            unload_one_by_one()
         if idle:
             try:
                 free_everything(before)
